@@ -8,7 +8,7 @@ use std::time::Instant;
 
 /// The arguments end up in the Cli struct
 #[derive(Parser, Debug)]
-#[clap(author, version, about="Tool to extract QC metrics from cram or bam", long_about = None)]
+#[clap(author, version, about="Tool to split one ubam file into multiple", long_about = None)]
 struct Args {
     /// bam file to split
     #[clap(value_parser)]
