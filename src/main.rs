@@ -1,15 +1,14 @@
 use clap::Parser;
-use rust_htslib::bam::{self, Read, Writer};
+use rust_htslib::bam::{self, Read};
+use std::cell::RefCell;
 use std::env;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::mpsc;
-use std::thread;
+use std::rc::Rc;
 use std::time::Instant;
 
 /// The arguments end up in the Cli struct
 #[derive(Parser, Debug)]
-#[clap(author, version, about = "Tool to split one ubam file into multiple", long_about = None)]
+#[clap(author, version, about="Tool to split one ubam file into multiple", long_about = None)]
 struct Args {
     /// bam file to split
     #[clap(value_parser)]
@@ -25,51 +24,68 @@ struct Args {
 }
 
 fn main() {
+    
     let args = Args::parse();
     let path = Path::new(&args.input);
-    let threads = args.threads; 
-    let thread_pool_first = rust_htslib::tpool::ThreadPool::new(args.threads).unwrap();
+
+    let thread_pool = rust_htslib::tpool::ThreadPool::new(args.threads).unwrap();
 
     let start_time = Instant::now();
-    // Read through once to get the exact number of records
+    // Read though once to get exact number of records
+    // This could be estimated instead
     let mut bam2 = bam::Reader::from_path(&path).unwrap();
-    bam2.set_thread_pool(&thread_pool_first).unwrap();
+    bam2.set_thread_pool(&thread_pool).unwrap();
     let number_of_records = bam2.records().count();
 
+    // Get the current time after executing the line of code
     let end_time = Instant::now();
+    // Calculate the elapsed time
     let elapsed_time = end_time.duration_since(start_time);
+    // Print the elapsed time
     println!("Time elapsed: {:?}", elapsed_time);
 
+    // Read for main function
     let mut bam = bam::Reader::from_path(&path).unwrap();
+    bam.set_thread_pool(&thread_pool).unwrap();
 
+    // Calculate how many splits
     let split_file_n_times = args.split;
     let records_per_file = number_of_records / split_file_n_times;
     let remainder = number_of_records % split_file_n_times;
-    let chunk_size = records_per_file + (remainder as f32 / split_file_n_times as f32).ceil() as usize;
+    let chunk_size =
+        records_per_file + (remainder as f32 / split_file_n_times as f32).ceil() as usize;
 
-    // Vector to hold senders for each thread
-    let mut senders = Vec::new();
-    let mut handles = Vec::new();
-    
-    let thread_count = (threads as f32 / split_file_n_times as f32).ceil() as u32;
+    // Put them into a vector
+    let mut chunk_index_vector: Vec<usize> = Vec::new();
+    for chunk_index in 1..=(number_of_records - 1) / chunk_size + 1 {
+        chunk_index_vector.push(chunk_index);
+    }
 
-    for chunk_index in 0..split_file_n_times {
+    // Open BAM writers for each unique chunk index
+    // Don't want to open a writer for each record
+    let mut writers: Vec<Option<Rc<RefCell<bam::Writer>>>> =
+        vec![None; (number_of_records - 1) / chunk_size + 1];
+
+    for chunk_index in chunk_index_vector {
         let file_name = format!(
             "{:03}.{}",
-            chunk_index + 1,
+            chunk_index,
             path.file_name().unwrap().to_str().unwrap()
         );
-
         let mut header = bam::Header::from_template(bam.header());
 
         let args: Vec<String> = env::args().collect();
         let command_line = args.join(" ");
+
+        // Convert string literals to byte slices
         let id = "splitbam";
         let pn = "splitbam";
         let vn = "0.1.0";
         let cl = command_line.as_str();
 
+        // Create a new program group record
         let mut pg_record = bam::header::HeaderRecord::new(b"PG");
+
         pg_record.push_tag(b"ID", id);
         pg_record.push_tag(b"PN", pn);
         pg_record.push_tag(b"VN", vn);
@@ -77,43 +93,25 @@ fn main() {
 
         header.push_record(&pg_record);
 
-        // Create a separate channel for each thread
-        let (tx, rx) = mpsc::channel();
-        senders.push(tx);
-
-        let bam_header = Arc::new(header);
-        let handle = thread::spawn(move || {
-            let writer_path = file_name;
-            let mut bam_writer = Writer::from_path(writer_path, &bam_header, bam::Format::Bam).unwrap();
-            let local_thread_pool = rust_htslib::tpool::ThreadPool::new(thread_count).unwrap(); // Create a separate ThreadPool for each thread
-            let _ = bam_writer.set_thread_pool(&local_thread_pool);
-
-            // Loop to receive and write records
-            while let Ok(record) = rx.recv() {
-                if let Err(err) = bam_writer.write(&record) {
-                    eprintln!("Error writing record: {}", err);
-                }
-            }
-        });
-
-        handles.push(handle);
+        // Create writer
+        let bam_writer = {
+            let mut writer = bam::Writer::from_path(&file_name, &header, bam::Format::Bam).unwrap();
+            let _ = writer.set_thread_pool(&thread_pool);
+            writer
+        };
+        let writer = Rc::new(RefCell::new(bam_writer));
+        writers[chunk_index - 1] = Some(writer);
     }
 
-    // This block is executed once to distribute records to threads
-    let mut record = bam::Record::new();
+    // Write records to file
+    let mut record = rust_htslib::bam::Record::new();
     let mut i = 0;
-    while let Some(Ok(_)) = bam.read(&mut record) {
-        let chunk_index = i / chunk_size;
-        let chunk_sender = &senders[chunk_index];
-        chunk_sender.send(record.clone()).unwrap();
+    while let Some(_r) = bam.read(&mut record) {
+        let chunk_index = i / chunk_size + 1;
+        let mut writer = writers[chunk_index - 1].as_ref().unwrap().borrow_mut();
         i += 1;
-    }
-
-    // Close all senders by dropping them
-    drop(senders);
-
-    // Wait for all threads to finish
-    for handle in handles {
-        handle.join().unwrap();
+        if let Err(err) = writer.write(&mut record) {
+            eprintln!("Error writing record: {}", err);
+        }
     }
 }
